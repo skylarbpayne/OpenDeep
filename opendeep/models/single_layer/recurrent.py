@@ -107,7 +107,7 @@ class RecurrentLayer(Model):
             # I used get_bias for initialization
             output_t0 = get_bias(shape=output_size, name="output_t0", init_values=output_t0_init)
         # Finally have the three parameters!
-        self.params = [Wx, W, b]
+        self.params = [Wx, W, output_t0, b]
 
         ###############
         # computation #
