@@ -17,11 +17,17 @@ __email__ = "opendeep-dev@googlegroups.com"
 # standard libraries
 import logging
 import os
-import cPickle
+import cPickle as pickle
+import time
+# third party libraries
+import theano
+import theano.tensor as T
+from theano.compat.python2x import OrderedDict  # use this compatibility OrderedDict
 # internal references
+from opendeep import function
 from opendeep.utils.config import combine_config_and_defaults
 from opendeep.utils import file_ops
-from opendeep.utils.misc import set_shared_values, get_shared_values
+from opendeep.utils.misc import set_shared_values, get_shared_values, make_time_units_string, raise_to_list
 
 log = logging.getLogger(__name__)
 
@@ -41,7 +47,10 @@ class Model(object):
     shouldn't be a breaking error.
     """
 
-    def __init__(self, config=None, defaults=None, inputs_hook=None, hiddens_hook=None, params_hook=None):
+    def __init__(self, config=None, defaults=None,
+                 inputs_hook=None, hiddens_hook=None, params_hook=None,
+                 output_size=None,
+                 **kwargs):
         """
         This creates the model's combined configuration params from config and defaults into a self.args
         dictionary-like object (meaning it implements collections.Mapping and you can use self.args.get('parameter')
@@ -81,29 +90,78 @@ class Model(object):
         two versions of the model that use the same parameters - such as a training model with dropout applied to layers
         and one without for testing, where the parameters are shared between the two.
         :type params_hook: List(theano shared variable)
+
+        :param output_size: the dimensionality of the output for this model. This is required for stacking models
+        automatically - where the input to one layer is the output of the previous layer. Currently, we cannot
+        compute the size from Theano's graph, so it needs to be explicit. This parameter can be None if it is specified
+        in the default or config dictionaries.
+        :type output_size: int
+
+        :param kwargs: this will be all the other left-over parameters passed to the class as a dictionary of
+        {param: value}. We will use the kwargs to finally combine defaults, config, and passed parameters together
+        into the self.args dict, making each model's parameters accessible by name in self.args
+        :type kwargs: dict
         """
         log.info("Creating a new instance of %s", str(type(self)))
 
         # set self.args to be the combination of the defaults and the config dictionaries
         self.args = combine_config_and_defaults(config, defaults)
 
-        # log the arguments.
-        log.debug("%s self.args from config parameters: %s", str(type(self)), str(self.args))
+        # if the args are none, make it a blank dictionary
+        if self.args is None:
+            self.args = {}
 
+        # now, go through the inputs_hook, hiddens_hook, params_hook, and output_size to add them to self.args
+        # if the variable isn't None, override the argument from config/default. (or add it if it doesn't exist)
+        if inputs_hook is not None or 'inputs_hook' not in self.args:
+            self.args['inputs_hook'] = inputs_hook
+
+        if hiddens_hook is not None or 'hiddens_hook' not in self.args:
+            self.args['hiddens_hook'] = hiddens_hook
+
+        if params_hook is not None or 'params_hook' not in self.args:
+            self.args['params_hook'] = params_hook
+
+        if output_size is not None or 'output_size' not in self.args:
+            self.args['output_size'] = output_size
+
+        # now that our required variables are out of the way, do the same thing for everything else passed via kwargs
+        for arg, val in kwargs.iteritems():
+            if (val is not None or str(arg) not in self.args) and str(arg) != 'kwargs':
+                self.args[str(arg)] = val
+            elif str(arg) == 'kwargs':
+                inner_kwargs = kwargs['kwargs']
+                for key, item in inner_kwargs.iteritems():
+                    if item is not None or str(key) not in self.args:
+                        self.args[str(key)] = item
+
+        # Magic! Now self.args contains the combination of all the initialization variables, overridden like so:
+        # defaults < config < kwargs (explicits)
+
+        # log the arguments.
+        log.debug("%s self.args: %s", str(type(self)), str(self.args))
+        # save the arguments.
+        self.save_args()
+
+        # Finally, to make things really easy, update the class 'self' with everything in self.args to make
+        # all the parameters accessible via self.<param>
+        self.__dict__.update(self.args)
+
+        # Boom! Hyperparameters are now dealt with. Take that!
 
     ######################################################################
     # Methods for the symbolic inputs, hiddens, and outputs of the model #
     ######################################################################
     def get_inputs(self):
         """
-        This should return the input(s) to the model's computation graph. This is called by the Optimizer when creating
-        the theano train function on the cost expression returned by get_train_cost().
+        This should return the input(s) to the model's computation graph as a list. This only includes inputs for the
+        predict function, not any inputs used for supervised training.
 
-        This should normally return the same theano variable list that is used in the inputs= argument to the f_predict
-        function.
+        Note: This should normally return the same theano variable list that is used in the inputs= argument to the
+        f_predict function.
         ------------------
 
-        :return: Theano variables representing the input(s) to the training function.
+        :return: Theano variables representing the input(s) to the model's 'predict' computation.
         :rtype: List(theano variable)
         """
         log.critical("%s does not have a get_inputs function!", str(type(self)))
@@ -164,25 +222,100 @@ class Model(object):
         :return: Theano/numpy tensor-like object that is the output of the model's computation graph.
         :rtype: tensor
         """
-        log.critical("%s predict method not implemented!", str(type(self)))
-        raise NotImplementedError("Please implement a predict method for %s" % str(type(self)))
+        # check if the predict function is already compiled, otherwise compile it!
+        if not hasattr(self, 'f_predict'):
+            log.debug("Compiling f_predict...")
+            t = time.time()
+            self.f_predict = function(inputs=self.get_inputs(),
+                                      outputs=self.get_outputs())
+            log.debug("Compilation done. Took %s", make_time_units_string(time.time() - t))
+
+        # because we use the splat to account for multiple inputs to the function, make sure input is a list.
+        input = raise_to_list(input)
+        # return the results of the predict function!
+        return self.f_predict(*input)
 
 
-    ###########################################################
-    # Methods to do with training the model with an Optimizer #
-    ###########################################################
-    def get_train_cost(self):
+    #########################################
+    # Methods to do with training the model #
+    #########################################
+    def get_targets(self):
         """
-        This returns the expression that represents the cost given an input, which is used for the Optimizer during
-        training. The reason we can't just compile a f_train theano function is because updates need to be calculated
-        for the parameters during gradient descent - and these updates are created in the Optimizer object.
+        This function returns the list of inputs that are used for supervised training. It should be the 'correct' or
+        'target' variables to compare against the output of the model's computation.
+
+        Example: the labels [Y] for a classification problem.
         ------------------
 
-        :return: theano expression of the model's training cost, from which parameter gradients will be computed.
-        :rtype: theano tensor
+        :return: Theano variables representing the target(s) to the model's computation.
+        :rtype: List(theano variable)
+        """
+        # Assume we have an unsupervised function, so no extra training variables. If this is going to be a supervised
+        # model, you have to return the list of extra 'label' (aka 'target') variables you created for the cost
+        # function here.
+        return []
+
+    def get_train_cost(self):
+        """
+        This returns the expression that represents the cost given an input, which is used during training.
+        The reason we can't just compile a f_train theano function is because updates need to be calculated
+        for the parameters during gradient descent - and these updates are created in the Optimizer object.
+
+        In the specialized case of layer-wise pretraining (or any version of pretraining in the model), you should
+        return a list of training cost expressions in order you want training to happen. This way the optimizer
+        will train each cost in sequence for your model, allowing for easy layer-wise pretraining in the model.
+        ------------------
+
+        :return: theano expression (or list of theano expressions)
+        of the model's training cost, from which parameter gradients will be computed.
+        :rtype: theano tensor or list(theano tensor)
         """
         log.critical("%s does not have a get_train_cost function!", str(type(self)))
         raise NotImplementedError("Please implement a get_train_cost method for %s" % str(type(self)))
+
+
+    def get_gradient(self, starting_gradient=None, cost=None, additional_cost=None):
+        """
+        This method allows you to define the gradient for this model manually. It should either work with a provided
+        starting gradient (from upstream layers/models), or grab the training cost if no start gradient is provided.
+
+        Theano's subgraph gradient function specified here:
+        http://deeplearning.net/software/theano/library/gradient.html#theano.gradient.subgraph_grad
+        warning: If the gradients of cost with respect to any of the start variables is already part of the
+        start dictionary, then it may be counted twice with respect to wrt and end.
+
+        You should only implement this method if you want to manually define your gradients for the model.
+        --------------------
+
+        :param starting_gradient: the starting, known gradients for variables
+        :type starting_gradient: dictionary of {variable: known_gradient}
+
+        :param additional_cost: any additional cost to add to the gradient
+        :type additional_cost: theano expression
+
+        :return: tuple of gradient with respect to inputs, and with respect to
+        :rtype:
+        """
+        # check if starting gradients was provided.
+        # if there are known gradients to start, use those instead of the cost for this model
+        if starting_gradient is not None:
+            params_grad, next_starting_grad = theano.subgraph_grad(wrt=self.get_params(),
+                                                                   end=self.get_inputs(),
+                                                                   start=starting_gradient,
+                                                                   cost=additional_cost,
+                                                                   details=False)
+        # otherwise, just use this model's cost to determine gradient
+        else:
+            # use the cost if it was given
+            cost = cost or self.get_train_cost()
+            if additional_cost is not None:
+                cost = T.sum(cost, additional_cost)
+            params_grad, next_starting_grad = theano.subgraph_grad(wrt=self.get_params(),
+                                                                   end=self.get_inputs(),
+                                                                   cost=cost,
+                                                                   details=False)
+        return (OrderedDict(zip(self.get_params(), params_grad)),
+                OrderedDict(zip(self.get_inputs(), next_starting_grad)))
 
 
     def get_updates(self):
@@ -201,13 +334,14 @@ class Model(object):
         """
         # TODO: should we do the parameter decays from get_decay_params() in the model updates?
         # TODO: Right now I'm not because it seems less modular
+        # TODO: do we need a list of these as well to deal with the possible list of get_train_cost()?
         # by default, assume the model doesn't have updates - it's your job to return them in this method.
         return None
 
 
     def get_monitors(self):
         """
-        This returns a dictionary of (monitor_name: monitor_function) of variables (monitors) whose values we care
+        This returns a dictionary of (monitor_name: monitor_expression) of variables (monitors) whose values we care
         about during training. For every monitor returned by this method, the function will be run on the
         train/validation/test dataset and its value will be reported.
 
@@ -215,7 +349,7 @@ class Model(object):
         exist!
         ------------------
 
-        :return: Dictionary of String: theano_function for each monitor variable we care about in the model.
+        :return: Dictionary of String: theano expression for each monitor variable we care about in the model.
         :rtype: Dictionary
         """
         # no monitors by default
@@ -361,7 +495,7 @@ class Model(object):
         # try to dump the param values
         with open(param_file, 'wb') as f:
             try:
-                cPickle.dump(params, f, protocol=cPickle.HIGHEST_PROTOCOL)
+                pickle.dump(params, f, protocol=pickle.HIGHEST_PROTOCOL)
             except Exception as e:
                 log.exception("Some issue saving model %s parameters to %s! Exception: %s",
                               str(type(self)), str(param_file), str(e))
@@ -392,7 +526,7 @@ class Model(object):
                       str(type(self)), str(param_file))
             # try to grab the pickled params from the specified param_file path
             with open(param_file, 'r') as f:
-                loaded_params = cPickle.load(f)
+                loaded_params = pickle.load(f)
             self.set_param_values(loaded_params)
             return True
         # if get_file_type didn't return pkl or none, it wasn't a pickle file
@@ -403,3 +537,36 @@ class Model(object):
         else:
             log.error("Param file %s couldn't be found!", str(param_file))
             return False
+
+    def save_args(self, args_file="config.pkl"):
+        """
+        This saves the model's initial configuration (self.args) in a pickle file.
+        -------------------
+
+        :param args_file: filename of pickled configs
+        :type args_file: string
+
+        :return: whether or not successful
+        :rtype: bool
+        """
+        args_file = os.path.realpath(args_file)
+
+        # force extension to be .pkl if it isn't a pickle file
+        _, extension = os.path.splitext(args_file)
+        if extension.lower() != ".pkl" or extension.lower() != ".pickle" or extension.lower() != ".p":
+            ''.join([args_file, '.pkl'])
+
+        log.debug('Saving %s configuration to %s...',
+                  str(type(self)), str(args_file))
+        # try to dump the param values
+        with open(args_file, 'wb') as f:
+            try:
+                pickle.dump(self.args, f, protocol=pickle.HIGHEST_PROTOCOL)
+            except Exception as e:
+                log.exception("Some issue saving model %s parameters to %s! Exception: %s",
+                              str(type(self)), str(args_file), str(e))
+                return False
+            finally:
+                f.close()
+
+        return True
