@@ -14,19 +14,21 @@ __email__ = "opendeep-dev@googlegroups.com"
 import logging
 # internal references
 from opendeep.models.model import Model
+from opendeep.models.single_layer.basic import BasicLayer
 from opendeep.utils.nnet import get_weights_gaussian, get_weights_uniform, get_bias
 from opendeep.utils.activation import get_activation_function
+from opendeep.utils.cost import get_cost_function
 #theano
 import theano
 import theano.tensor as T
+#external
+import numpy as np
 
 log = logging.getLogger(__name__)
 
 class RecurrentLayer(Model):
     """
     Your run-of-the-mill recurrent model. Normally not as good as LSTM/GRU, but it is simplest.
-    
-    TODO: update description
     """
     default = {
         'activation': 'tanh', #type of activation function to use for output
@@ -40,11 +42,11 @@ class RecurrentLayer(Model):
         'input_size': None,
         'output_size': None
     }
-
+    #TODO: [output, input1, input2, input3] -> [0, -3, -2, -1]. Is this interface confusing?
     def __init__(self, inputs_hook=None, config=None, defaults=default, params_hook=None,
                 input_size=None, output_size=None, activation=None, weights_init=None,
                 weights_mean=None, weights_std=None, weights_interval=None, bias_init=None,
-                transition=None, taps={0: [-1], -1: [0]}, backwards=False, **kwargs):
+                transition=None, taps={0: [-1], -1: [0]}, go_backwards=False, **kwargs):
         #init Model to combine defaults and config dictionaries.
         super(RecurrentLayer, self).__init__(**{arg: val for (arg, val) in locals().iteritems() if arg is not 'self'})
         # all configuration parameters are now in self.args
@@ -59,7 +61,8 @@ class RecurrentLayer(Model):
             self.input = self.inputs_hook[1]
         else:
             # make the iput a symbolic matrix
-            self.input = T.fmatrix('X')
+            #TODO: split this line
+            self.input = T.fmatrix('X') if type(self.input_size) is not list else [T.fmatrix('X%d' % i) for i in xrange(len(self.input_size))]
        
         #RNN can take in inputs from multiple sources. Store in a list:
         if type(self.input) is not list:
@@ -70,21 +73,12 @@ class RecurrentLayer(Model):
         self.target = T.fmatrix('Y')
 
         # either grab from the paramter directly, self.args config, or copy n_in
-        output_size = self.output_size or self.input_size
+        self.output_size = self.output_size or self.input_size
         
         self.taps = taps
         if 0 not in self.taps:
             self.taps[0] = []
-
-        #activation function
-        if isinstance(self.activation, basestring):
-            activation_func = get_activation_function(activation_name)
-        else:
-            assert callable(self.activation)
-            activation_func = self.activation
         
-#transition model here?
-
         #cost function
         #if a string name was given, look up the correct function
         if isinstance(self.cost, basestring):
@@ -100,6 +94,7 @@ class RecurrentLayer(Model):
         ####################################################
         #you can either specify a transition function, or a basic layer will be used by default.
         if transition is not None:
+            #TODO: assert that it is of type model -- assert input and output size?
             raise NotImplementedError("Deep Transitions for RNN is not yet implemented")
         else:
             #need to find the input_size for the basic layer
@@ -108,28 +103,33 @@ class RecurrentLayer(Model):
             # how much work do we shift to the user?
             #for an initial go, let's just use size of input and size of output
             all_sizes = [self.output_size] + self.input_size
-            transition_input_size = sum([all_sizes[k] * len(v) for k,v in self.taps]) 
+            transition_input_size = sum([all_sizes[k] * len(v) for k,v in self.taps.iteritems()]) 
             
             transition_args = {arg: val for (arg, val) in locals().iteritems() if arg is not 'self'}
-            transition_args['input_size'] = transition_input_size
+            transition_args['inputs_hook'] = (transition_input_size, T.fvector('X_transition'))
             self.transition = BasicLayer(**transition_args)
         #Nothing about the params_hook because that's taken care of in transition
 
         ###############
         # computation #
         ###############
+        #TODO: fix formatting
         self.output, _ = theano.scan(self._step,
-                    sequences=[dict(input=self.input[k], taps=v) for k,v in self.taps if k is not 0], #first dimension for all inputs should be Time
-                    outputs_info=[dict(initial=T.zeros_like(self.output), taps=self.taps[0])], #The output at the time step before your first input
-                    go_backwards=backwards)
+                    sequences=[dict(input=self.input[k], taps=v) for k,v in self.taps.iteritems() if k is not 0], #first dimension for all inputs should be Time
+                    outputs_info=[dict(initial=T.zeros_like(self.transition.output), taps=self.taps[0])], #The output at the time step before your first input
+                    go_backwards=go_backwards)
 
         self.cost = cost_func(output=self.output, target=self.target, **self.cost_args) 
-        log.debug("Initialized a recurrent, fully-connected layer with shape %s and activation: %s" %
-                    (str((input_size, output_size)), str(activation_name)))
-
+        log.debug("Initialized a recurrent, fully-connected layer with shape %s and transition: %s" %
+                    (str((self.input_size, self.output_size)), str(self.transition)))
+    
     def _step(self, *args):
-        full_input = T.concatenate(args)
-        return self.transition.predict(full_input)
+        for i,a in enumerate(args):
+            log.info("X%d - %s" % (i, str(a.type)))
+        full_input = T.concatenate([a.flatten() for a in args],axis=0)
+        replaces = {self.transition.input: full_input}
+        out = theano.clone(self.transition.output, replace=replaces)
+        return out
 
     def get_inputs(self):
         return [self.input]
