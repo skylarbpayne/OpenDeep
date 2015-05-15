@@ -1,6 +1,4 @@
 """
-.. module:: statistics
-
 This module is used for computing statistics such as mean, variance, mode, regularization values, etc.
 """
 
@@ -15,6 +13,7 @@ __email__ = "opendeep-dev@googlegroups.com"
 import logging
 # third party libraries
 import theano.tensor as T
+import theano.compat.six as six
 # internal imports
 from opendeep.utils.misc import raise_to_list
 
@@ -22,13 +21,18 @@ log = logging.getLogger(__name__)
 
 def get_stats(input, stat=None):
     """
-    returns a dictionary mapping the name of the statistic to the result on the input
+    Returns a dictionary mapping the name of the statistic to the result on the input.
+    Currently gets mean, var, std, min, max, l1, l2.
 
-    :param input: theano tensor
-    :type input: tensor
+    Parameters
+    ----------
+    input : tensor
+        Theano tensor to grab stats for.
 
-    :return: dictionary of all the statistics expressions
-    :rtype: dict(string: theano expression)
+    Returns
+    -------
+    dict
+        Dictionary of all the statistics expressions {string_name: theano expression}
     """
     stats = {
         'mean': T.mean(input),
@@ -46,6 +50,6 @@ def get_stats(input, stat=None):
         return stats
 
     for stat in stat_list:
-        if isinstance(stat, basestring) and stat in stats:
+        if isinstance(stat, six.string_types) and stat in stats:
             compiled_stats.update({stat: stats[stat]})
     return compiled_stats
